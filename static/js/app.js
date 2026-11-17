@@ -7,7 +7,14 @@
   let selected = null;
   let detail = null;
   let reports = [];
-  let form = { object_key: "", content_hash: "", byte_size: "100" };
+  let conflicts = [];
+  let form = {
+    object_key: "",
+    content_hash: "",
+    byte_size: "100",
+    on_conflict: "reject",
+    repackage: false,
+  };
 
   async function api(path, opts = {}) {
     const r = await fetch(path, {
@@ -32,6 +39,7 @@
     document.getElementById("lab-brand").textContent = meta.lab_name || "湖区清单台";
     batches = (await api("/api/batches")).items || [];
     reports = (await api("/api/visibility-reports")).items || [];
+    conflicts = (await api("/api/conflicts")).items || [];
   }
 
   async function openBatch(id) {
@@ -46,22 +54,43 @@
     if (!selected) return;
     setMsg("");
     try {
-      await api("/api/batches/" + selected + "/objects", {
+      const r = await api("/api/batches/" + selected + "/objects", {
         method: "POST",
         body: JSON.stringify({
           object_key: form.object_key,
           content_hash: form.content_hash,
           byte_size: Number(form.byte_size || 0),
+          on_conflict: form.on_conflict,
+          repackage: form.repackage,
         }),
       });
-      form = { object_key: "", content_hash: "", byte_size: "100" };
-      await openBatch(selected);
-      await refresh();
-      setMsg("已登记对象");
-      render();
+      form.object_key = "";
+      form.content_hash = "";
+      form.repackage = false;
+      setMsg(r.message || "已登记对象");
+    } catch (e) {
+      // 失败（含拒登）也要刷新三面：对象行可能已上锁、冲突队列已记结局
+      setMsg(e.message);
+    }
+    await openBatch(selected);
+    await refresh();
+    render();
+  }
+
+  async function doRecheck(objectId) {
+    setMsg("");
+    try {
+      const r = await api("/api/objects/" + objectId + "/recheck", {
+        method: "POST",
+        body: "{}",
+      });
+      setMsg(r.message || "复检通过，已放行");
     } catch (e) {
       setMsg(e.message);
     }
+    if (selected) await openBatch(selected);
+    await refresh();
+    render();
   }
 
   async function doClose() {
@@ -101,6 +130,41 @@
     });
   }
 
+  function strategyLabel(s) {
+    return s === "rebuild" ? "重建指纹" : "拒绝锁定";
+  }
+
+  function outcomeChip(outcome) {
+    const cls = outcome === "已重建" ? "chip chip-rebuild" : "chip chip-reject";
+    return `<span class="${cls}">${outcome}</span>`;
+  }
+
+  function objectStatus(o) {
+    let html = `<span class="pill">${o.status}</span>`;
+    if (o.recheck) html += ` <span class="chip chip-warn">待复检</span>`;
+    if (o.locked) html += ` <span class="chip chip-reject">已锁定</span>`;
+    return html;
+  }
+
+  function conflictTable(rows, withBatch) {
+    return `<table>
+      <thead><tr>
+        ${withBatch ? "<th>批次</th>" : ""}<th>编号</th><th>对象键</th><th>旧指纹</th><th>新指纹</th><th>策略</th><th>结局</th><th>灌数员</th><th>时间</th>
+      </tr></thead>
+      <tbody>
+        ${rows
+          .map(
+            (c) => `<tr>
+          ${withBatch ? `<td>#${c.batch_id}</td>` : ""}<td>${c.id}</td><td>${c.object_key}</td><td>${c.old_hash}</td><td>${c.new_hash}</td>
+          <td>${strategyLabel(c.strategy)}</td><td>${outcomeChip(c.outcome)}</td>
+          <td>${c.actor || "—"}</td><td>${c.created_at}</td>
+        </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>`;
+  }
+
   function renderBatches() {
     return `
       <h2>落地批次</h2>
@@ -129,6 +193,7 @@
     }
     const b = detail.batch;
     const objs = detail.objects || [];
+    const confs = detail.conflicts || [];
     return `
       <h2>批次详情 #${b.id}</h2>
       <p>${b.zone_name} · ${b.biz_date} · <span class="pill">${b.status}</span></p>
@@ -137,25 +202,43 @@
         <button type="button" class="secondary" id="btn-report-from-detail">跑可见性对账</button>
       </div>
       <div class="panel">
-        <h3>登记对象</h3>
+        <h3>登记对象（去重灌库）</h3>
+        <p class="muted">同键同指纹幂等放行；同键不同指纹按互斥策略一次落成，结局进冲突队列。</p>
         <label>对象键<input id="f-key" value="${form.object_key}" /></label>
         <label>内容指纹<input id="f-hash" value="${form.content_hash}" /></label>
         <label>字节数<input id="f-size" value="${form.byte_size}" /></label>
-        <button type="button" id="btn-register">写入登记</button>
+        <div class="strategy-row">
+          <span class="muted">指纹失配策略（互斥）：</span>
+          <label class="inline"><input type="radio" name="onconf" value="reject" ${form.on_conflict === "reject" ? "checked" : ""} /> 拒绝锁定（须重打包）</label>
+          <label class="inline"><input type="radio" name="onconf" value="rebuild" ${form.on_conflict === "rebuild" ? "checked" : ""} /> 重建指纹（强制复检）</label>
+        </div>
+        <label class="inline"><input type="checkbox" id="f-repack" ${form.repackage ? "checked" : ""} /> 重打包解锁（仅对已锁定键，须带原指纹）</label>
+        <div><button type="button" id="btn-register">写入登记</button></div>
       </div>
       <h3>对象列表</h3>
       <table>
-        <thead><tr><th>键</th><th>指纹</th><th>字节</th><th>状态</th></tr></thead>
+        <thead><tr><th>键</th><th>指纹</th><th>字节</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
           ${objs
             .map(
               (o) => `<tr>
-            <td>${o.object_key}</td><td>${o.content_hash}</td><td>${o.byte_size}</td><td>${o.status}</td>
+            <td>${o.object_key}</td><td>${o.content_hash}</td><td>${o.byte_size}</td>
+            <td>${objectStatus(o)}</td>
+            <td>${o.recheck ? `<button type="button" class="secondary" data-recheck="${o.id}">复检放行</button>` : ""}</td>
           </tr>`
             )
             .join("")}
         </tbody>
-      </table>`;
+      </table>
+      <h3>本批冲突结局</h3>
+      ${confs.length ? conflictTable(confs, false) : `<p class="muted">暂无冲突记录。</p>`}`;
+  }
+
+  function renderConflicts() {
+    return `
+      <h2>冲突队列</h2>
+      <p class="muted">同键不同指纹的灌库结局芯片：拒登锁定须重打包，或重建指纹强制复检；去重灌库可据此复验。</p>
+      ${conflicts.length ? conflictTable(conflicts, true) : `<p class="muted">暂无冲突记录。</p>`}`;
   }
 
   function renderReports() {
@@ -179,6 +262,7 @@
   function render() {
     if (tab === "batches") view.innerHTML = renderBatches();
     else if (tab === "detail") view.innerHTML = renderDetail();
+    else if (tab === "conflicts") view.innerHTML = renderConflicts();
     else view.innerHTML = renderReports();
 
     view.querySelectorAll("[data-open]").forEach((btn) => {
@@ -189,11 +273,19 @@
       const key = document.getElementById("f-key");
       const hash = document.getElementById("f-hash");
       const size = document.getElementById("f-size");
+      const repack = document.getElementById("f-repack");
       key.oninput = () => (form.object_key = key.value);
       hash.oninput = () => (form.content_hash = hash.value);
       size.oninput = () => (form.byte_size = size.value);
+      repack.onchange = () => (form.repackage = repack.checked);
+      document.querySelectorAll('input[name="onconf"]').forEach((radio) => {
+        radio.onchange = () => (form.on_conflict = radio.value);
+      });
       reg.onclick = doRegister;
     }
+    view.querySelectorAll("[data-recheck]").forEach((btn) => {
+      btn.onclick = () => doRecheck(Number(btn.dataset.recheck));
+    });
     const closeBtn = document.getElementById("btn-close");
     if (closeBtn) closeBtn.onclick = doClose;
     const r1 = document.getElementById("btn-report");

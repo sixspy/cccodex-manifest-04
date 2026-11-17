@@ -19,6 +19,15 @@ def close_batch(batch_id: int, db_path: str | None = None) -> dict:
         ).fetchall()
         if not objs:
             raise ServiceError("空批不可闭合", 400)
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM landing_objects "
+            "WHERE batch_id=? AND status='已登记' AND recheck=1",
+            (batch_id,),
+        ).fetchone()["c"]
+        if pending:
+            raise ServiceError(
+                f"有 {pending} 个对象重建指纹后待复检，强制复检放行后才可闭合", 409
+            )
         n = len(objs)
         conn.execute(
             "UPDATE landing_batches SET status='已闭合', closed_object_count=? WHERE id=?",

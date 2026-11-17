@@ -13,8 +13,10 @@ from app.services import (
     close_batch,
     get_batch,
     list_batches,
+    list_conflicts,
     list_objects,
     list_reports,
+    recheck_object,
     register_object,
     run_visibility,
 )
@@ -126,31 +128,75 @@ async def api_batch_detail(request: Request, batch_id: int) -> dict:
     batch = get_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
-    return {"batch": batch, "objects": list_objects(batch_id)}
+    return {
+        "batch": batch,
+        "objects": list_objects(batch_id),
+        "conflicts": list_conflicts(batch_id),
+    }
 
 
 @post("/api/batches/{batch_id:int}/objects")
 async def api_register(request: Request, batch_id: int) -> Response:
-    require_user(request)
+    user = require_user(request)
     body = await request.json()
     try:
-        obj = register_object(
+        result = register_object(
             batch_id,
             str(body.get("object_key", "")),
             str(body.get("content_hash", "")),
             int(body.get("byte_size", 0)),
+            on_conflict=str(body.get("on_conflict", "reject")),
+            repackage=bool(body.get("repackage", False)),
+            actor=user,
         )
     except ServiceError as exc:
         return Response(
-            content={"ok": False, "error": exc.message},
+            content={"ok": False, "error": exc.message, **exc.payload},
+            status_code=exc.status_code,
+            media_type="application/json",
+        )
+    # 拒登也是落成的结局（冲突队列已记），但对灌数员是失败：409 + 白话
+    if result["outcome"] == "已拒登":
+        return Response(
+            content={
+                "ok": False,
+                "error": result["message"],
+                "outcome": result["outcome"],
+                "object": result["object"],
+                "conflict": result["conflict"],
+            },
+            status_code=409,
+            media_type="application/json",
+        )
+    return Response(
+        content={"ok": True, **result},
+        status_code=200,
+        media_type="application/json",
+    )
+
+
+@post("/api/objects/{object_id:int}/recheck")
+async def api_recheck(request: Request, object_id: int) -> Response:
+    require_user(request)
+    try:
+        result = recheck_object(object_id)
+    except ServiceError as exc:
+        return Response(
+            content={"ok": False, "error": exc.message, **exc.payload},
             status_code=exc.status_code,
             media_type="application/json",
         )
     return Response(
-        content={"ok": True, "object": obj},
+        content={"ok": True, **result},
         status_code=200,
         media_type="application/json",
     )
+
+
+@get("/api/conflicts")
+async def api_conflicts(request: Request, batch_id: int | None = None) -> dict:
+    require_user(request)
+    return {"items": list_conflicts(batch_id=batch_id)}
 
 
 @post("/api/batches/{batch_id:int}/close")
@@ -200,6 +246,8 @@ app = Litestar(
         api_batches,
         api_batch_detail,
         api_register,
+        api_recheck,
+        api_conflicts,
         api_close,
         api_reports,
         api_run_report,

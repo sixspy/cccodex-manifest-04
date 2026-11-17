@@ -27,6 +27,24 @@ def get_db(db_path: str | None = None):
         conn.close()
 
 
+@contextmanager
+def write_db(db_path: str | None = None):
+    """串行写事务：BEGIN IMMEDIATE 先拿写锁，两名灌数员抢同一键时排队而非互相覆盖。"""
+    conn = connect(db_path)
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS landing_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,8 +64,24 @@ CREATE TABLE IF NOT EXISTS landing_objects (
   content_hash TEXT NOT NULL,
   byte_size INTEGER NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('已登记','已闭合','已作废')),
+  locked INTEGER NOT NULL DEFAULT 0,
+  recheck INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(batch_id, object_key),
+  FOREIGN KEY(batch_id) REFERENCES landing_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS ingest_conflicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL,
+  object_key TEXT NOT NULL,
+  old_hash TEXT NOT NULL,
+  new_hash TEXT NOT NULL,
+  strategy TEXT NOT NULL CHECK (strategy IN ('reject_lock','rebuild')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('已拒登','已重建')),
+  actor TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY(batch_id) REFERENCES landing_batches(id)
 );
 
@@ -87,9 +121,24 @@ SEED_BATCHES = [
 ]
 
 
+OBJECT_EXTRA_COLUMNS = (
+    ("locked", "INTEGER NOT NULL DEFAULT 0"),
+    ("recheck", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _ensure_object_columns(conn) -> None:
+    """老库补列：locked（拒登锁定）/ recheck（强制复检）。"""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(landing_objects)")}
+    for name, ddl in OBJECT_EXTRA_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE landing_objects ADD COLUMN {name} {ddl}")
+
+
 def init_db(db_path: str | None = None) -> None:
     with get_db(db_path) as conn:
         conn.executescript(SCHEMA)
+        _ensure_object_columns(conn)
         row = conn.execute("SELECT value FROM meta WHERE key='seeded'").fetchone()
         if row:
             return
